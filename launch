@@ -1,0 +1,119 @@
+#!/bin/bash
+
+set -euo pipefail
+
+DISK_ID=/dev/disk/by-id/usb-HTS72101_0G9SA00_0123456789CB-0:0
+
+# Temporary mount points: a ramfs staging area for the launch, and the FAT32 we will write the new UKI to.
+PREPDIR=$(mktemp -d)
+UKIFAT=$(mktemp -d)
+
+# Resolve the script's own location and the block device backing it. We need both so we can
+# detach from the launch volume before overwriting the disk.
+SCRIPT_DIR="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
+SCRIPT_DEV="$(df --output=source "$SCRIPT_DIR" | tail -n 1)"
+
+# This script rewrites the partition table of the block device it lives on. If it were executed
+# directly rather than sourced, the running bash process would hold the launch volume open and
+# the rewrite would fail. Refuse to continue if we are not sourced.
+(return 0 2>/dev/null) || {
+    echo "FATAL: this script must be sourced, not executed" >&2
+    exit 1
+}
+
+# Without copytoram, the live system stays bound to the disk and we cannot rewrite it.
+# Without checksum, we have no integrity guarantee on the environment from which we are
+# launching the hidden system. Both are required.
+grep -qw copytoram /proc/cmdline && grep -qw checksum /proc/cmdline || {
+    echo "FATAL: copytoram and checksum are both required on the kernel cmdline" >&2
+    return 1
+}
+
+# Optional flags:
+#   --interactive  drops to a shell in the staging directory before launch, useful for
+#                  inspecting or modifying cmdline / artifacts on the fly.
+#   --kexec        skips the disk-rewrite path entirely and just kexecs into the new kernel.
+INTERACTIVE=0
+USE_KEXEC=0
+for arg in "$@"; do
+    case "$arg" in
+        --interactive) INTERACTIVE=1 ;;
+	--kexec) USE_KEXEC=1 ;;
+	*) echo "Unknown flag: $arg" >&2; return 1 ;;
+    esac
+done
+
+# Disable swap so an oversized ramfs can never spill confidential data to disk.
+swapoff -a \
+    || { echo "FATAL: swapoff failed" >&2; return 1; }
+
+# Stage everything in ramfs so no intermediate writes hit the disk, then detach the launch
+# volume so we can safely rewrite the underlying device.
+mount -t ramfs ramfs "$PREPDIR" \
+    || { echo "FATAL: could not mount ramfs at $PREPDIR" >&2; return 1; }
+cp -a "$SCRIPT_DIR"/* "$PREPDIR"/ \
+    || { echo "FATAL: could not copy script directory into ramfs" >&2; return 1; }
+cd "$PREPDIR" \
+    || { echo "FATAL: could not cd into $PREPDIR" >&2; return 1; }
+
+umount "$SCRIPT_DEV" \
+    || { echo "FATAL: could not umount launch volume $SCRIPT_DEV" >&2; return 1; }
+cryptsetup close "$SCRIPT_DEV" \
+    || { echo "FATAL: could not close LUKS mapping $SCRIPT_DEV" >&2; return 1; }
+
+# Optional interactive checkpoint: drop into a shell so the operator can adjust anything in the
+# staging directory before commitment. Exiting the shell non-zero aborts the launch.
+if [ "$INTERACTIVE" == "1" ]; then
+    echo "=== Interactive mode; dropping to shell in $PREPDIR ==="
+    echo "=== Exit shell (Ctrl-D or 'exit') to continue with launch ==="
+    echo "=== Exit with non-zero status to abort ==="
+    bash -i || { echo "Interactive shell exited non-zero, aborting" >&2; return 1; }
+    echo "=== Resuming launch ==="
+fi
+
+# kexec path: hand off directly to the new kernel without touching the disk.
+# If this succeeds, control never returns to the script.
+if [ "$USE_KEXEC" == "1" ]; then
+    kexec -l vmlinuz --initrd=initrd.img --append="$(cat cmdline)" \
+        || { echo "FATAL: kexec -l failed" >&2; return 1; }
+    kexec -e
+    echo "FATAL: kexec -e returned, system did not transition" >&2
+    return 1
+fi
+
+# Capture the head of the disk as the raw-bytes portion of the baseline. The rest of the
+# disk is restored separately via a seeded CSPRNG, so this head is the only part that has
+# to be stored verbatim. Capturing at launch rather than at deployment keeps access metadata
+# from being suspiciously reset to a fixed state every time we launch.
+dd if="$DISK_ID" of=baseline-head-64M.img bs=1M count=64 \
+    || { echo "FATAL: could not capture disk baseline head from $DISK_ID" >&2; return 1; }
+echo baseline-head-64M.img | cpio -oH newc > baseline-head.cpio \
+    || { echo "FATAL: could not wrap baseline-head-64M.img in cpio" >&2; return 1; }
+
+# Overwrite the disk with the pre-built deployment image, then expose its first partition so
+# we can write the freshly-assembled UKI onto it.
+dd if=deployment-fat.img of="$DISK_ID" bs=1M \
+    || { echo "FATAL: could not write deployment image to $DISK_ID" >&2; return 1; }
+sync
+partprobe \
+    || { echo "FATAL: partprobe failed" >&2; return 1; }
+
+mount "${DISK_ID}-part1" "$UKIFAT" \
+    || { echo "FATAL: could not mount ${DISK_ID}-part1 at $UKIFAT" >&2; return 1; }
+
+# Assemble the UKI in place on the new FAT32. The baseline-head cpio is concatenated ahead of
+# the main initrd so the kernel sees it as an uncompressed early-cpio segment and the hidden
+# system can restore the captured baseline head on boot.
+objcopy \
+--add-section .osrel="/usr/lib/os-release"                 --change-section-vma .osrel=0x14dfa9000 \
+--add-section .cmdline="cmdline"                           --change-section-vma .cmdline=0x14dfaa000 \
+--add-section .initrd=<(cat initrd.img baseline-head.cpio) --change-section-vma .initrd=0x14dfab000 \
+--add-section .linux="vmlinuz"                             --change-section-vma .linux=0x16951b000 \
+"linuxx64.efi.stub" \
+"$UKIFAT/EFI/BOOT/BOOTX64.EFI" \
+    || { echo "FATAL: objcopy UKI assembly failed" >&2; return 1; }
+sync
+
+# Power off immediately. Anything we do from here forward risks creating state that no longer
+# matches the baseline snapshot we just captured, which would break the restore on the other side.
+poweroff
